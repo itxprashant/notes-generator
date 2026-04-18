@@ -1,2 +1,6 @@
 /.env
 /.venv
+__pycache__/
+**/__pycache__
+**/*.pyc
+pipeline/__pycache__/bedrock_client.cpython-314.pyc

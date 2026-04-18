@@ -18,9 +18,9 @@ from pathlib import Path
 from pdf2image import convert_from_path
 from PIL import Image
 
-from .bedrock_client import BedrockClaudeClient, ConverseResult
 from .figure_extractor import CroppedFigure, crop_figures, parse_pass1_json
 from .prompts import PASS1_SYSTEM, PASS2_SYSTEM, pass1_user_intro, pass2_user
+from .providers import KNOWN_PROVIDERS, LLMClient, LLMResult, make_client
 
 logger = logging.getLogger("pdf_to_latex")
 
@@ -31,6 +31,14 @@ logger = logging.getLogger("pdf_to_latex")
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
+    """Load `.env` (`KEY=VALUE` lines) into os.environ without overriding existing vars.
+
+    Recognized keys are pass-through and used by individual providers:
+    `LLM_PROVIDER`, `LLM_MODEL`, `THINKING_BUDGET_TOKENS`,
+    `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+    `OPENROUTER_API_KEY`, `AWS_REGION`, `BEDROCK_MODEL_ID`,
+    `BEDROCK_API_KEY` (auto-mapped to `AWS_BEARER_TOKEN_BEDROCK`).
+    """
     if not path.exists():
         return
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -81,7 +89,7 @@ def rasterize_pdf(
 # ---------------------------------------------------------------------------
 
 
-def _log_usage(label: str, res: ConverseResult) -> None:
+def _log_usage(label: str, res: LLMResult) -> None:
     logger.info(
         "%s usage: input=%d  output=%d  total=%d  thinking_chars=%d",
         label,
@@ -92,20 +100,6 @@ def _log_usage(label: str, res: ConverseResult) -> None:
     )
 
 
-def _model_output_cap(model_id: str) -> int:
-    """Per-model maximum output tokens. Conservative defaults."""
-    mid = model_id.lower()
-    if "anthropic" in mid:
-        return 16000
-    if "amazon.nova" in mid:
-        return 9500           # Nova caps around 10k
-    if "meta.llama4" in mid:
-        return 8000
-    if "mistral.pixtral" in mid:
-        return 8000
-    return 4000
-
-
 def _batch_pages(n_pages: int, batch_size: int) -> list[tuple[int, int]]:
     out = []
     for start in range(1, n_pages + 1, batch_size):
@@ -114,17 +108,17 @@ def _batch_pages(n_pages: int, batch_size: int) -> list[tuple[int, int]]:
 
 
 def run_pass1(
-    client: BedrockClaudeClient,
+    client: LLMClient,
     page_image_paths: list[Path],
     work_dir: Path,
     thinking: bool = True,
     batch_size: int = 4,
 ) -> dict:
     n = len(page_image_paths)
-    cap = _model_output_cap(client.model_id)
+    cap = client.default_max_output_tokens()
     batches = _batch_pages(n, batch_size)
     logger.info("pass 1: %d pages -> %d batch(es) of up to %d, model=%s, max_out=%d, thinking=%s",
-                n, len(batches), batch_size, client.model_id, cap, thinking)
+                n, len(batches), batch_size, client.model, cap, thinking)
 
     merged: dict = {
         "title": "",
@@ -137,9 +131,9 @@ def run_pass1(
 
     for bi, (start, end) in enumerate(batches, start=1):
         intro = pass1_user_intro(start, end, n)
-        blocks: list = [BedrockClaudeClient.text_block(intro)]
+        blocks: list = [client.text_block(intro)]
         for p in page_image_paths[start - 1:end]:
-            blocks.append(BedrockClaudeClient.image_block(p))
+            blocks.append(client.image_block(p))
 
         logger.info("  batch %d/%d: pages %d..%d", bi, len(batches), start, end)
         try:
@@ -200,7 +194,7 @@ def run_pass1(
 
 
 def run_pass2(
-    client: BedrockClaudeClient,
+    client: LLMClient,
     manifest: dict,
     cropped: list[CroppedFigure],
     work_dir: Path,
@@ -221,11 +215,11 @@ def run_pass2(
     available_files = sorted(c.file for c in cropped if c.file)
     user_text = pass2_user(json.dumps(enriched, indent=2, ensure_ascii=False), available_files)
 
-    cap = _model_output_cap(client.model_id)
+    cap = client.default_max_output_tokens()
     logger.info("pass 2: requesting final .tex from %s (thinking=%s, max_out=%d)",
-                client.model_id, thinking, cap)
+                client.model, thinking, cap)
     result = client.converse(
-        user_blocks=[BedrockClaudeClient.text_block(user_text)],
+        user_blocks=[client.text_block(user_text)],
         system=PASS2_SYSTEM,
         max_tokens=cap,
         thinking=thinking,
@@ -270,7 +264,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="disable extended thinking (useful if billing isn't enabled for it)",
     )
-    parser.add_argument("--model", default=None, help="override BEDROCK_MODEL_ID")
+    parser.add_argument(
+        "--provider",
+        choices=KNOWN_PROVIDERS,
+        default=None,
+        help="LLM provider (default: $LLM_PROVIDER, then auto-detected from model, then 'gemini')",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="model id (default: $LLM_MODEL or $BEDROCK_MODEL_ID, then provider's default)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -291,10 +295,10 @@ def main(argv: list[str] | None = None) -> int:
     work_dir = args.work_dir
     figures_dir = args.figures_dir
 
-    client = BedrockClaudeClient(model_id=args.model)
+    client = make_client(provider=args.provider, model=args.model)
     use_thinking = not args.no_thinking
-    logger.info("model=%s region=%s thinking=%s thinking_budget=%d",
-                client.model_id, client.region, use_thinking, client.thinking_budget)
+    logger.info("provider=%s model=%s thinking=%s thinking_budget=%d",
+                client.provider_name, client.model, use_thinking, client.thinking_budget)
 
     pages = rasterize_pdf(args.pdf, work_dir / "pages", dpi=args.dpi, max_side=args.max_side)
 
